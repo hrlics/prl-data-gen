@@ -2,6 +2,7 @@ import json
 import logging
 import random
 import re
+from functools import lru_cache
 from typing import Any, Dict, List, Tuple
 
 import datasets
@@ -9,6 +10,9 @@ import hydra
 from datasets import load_dataset
 from omegaconf import DictConfig, ListConfig, OmegaConf
 import pandas as pd
+import numpy as np
+from scipy.stats import norm
+from transformers import AutoTokenizer
 
 """
 math_verify expects the following LaTeX format for the gold answer (with $ or \\boxed).
@@ -19,6 +23,309 @@ and this will not parse:
 """
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=4)
+def _get_tokenizer(model_path: str):
+    return AutoTokenizer.from_pretrained(model_path)
+
+
+def process_genvf_summary_llm_judge(
+    dataset,
+    dataset_name,
+    squash_score=False,
+    model_path=None,
+    max_input_tokens=25000,
+):
+
+    assert dataset['input_to_VF'] is not None, "input_to_VF field is required for genvf summary llm judge datasets"
+    assert dataset['high_level_suffix_summary'] is not None, "high_level_suffix_summary field is required for genvf summary llm judge datasets"
+
+    if model_path is None:
+        raise ValueError(
+            "process_genvf_summary_llm_judge requires model_path to tokenize and "
+            "filter input_to_VF by length. Pass it via dataset_loader_params.model_path."
+        )
+    tokenizer = _get_tokenizer(model_path)
+
+    total = 0
+    dropped = 0
+    max_len_seen = 0
+
+    for item in dataset:
+        total += 1
+        summary_list = [i for i in item['high_level_suffix_summary'] if i!=""] # filter out empty summaries
+        if summary_list == []:
+            dropped += 1
+          
+        problem = item['problem']
+        prefix = item['prefix']
+        prompt = item['input_to_VF']
+
+        n_tokens = len(tokenizer.encode(prompt, add_special_tokens=False))
+        if n_tokens > max_len_seen:
+            max_len_seen = n_tokens
+        if n_tokens > max_input_tokens:
+            dropped += 1
+            continue
+
+        yield {
+            "problem": problem,
+            "prefix": prefix,
+            "prefix_summary_steps": item.get('prefix_summary_steps', prefix),
+            "answer": item["answer"],
+            "gemini_summary_list": summary_list,
+            "dataset": dataset_name,
+            "task": prompt,
+            "squash_score": squash_score,
+        }
+
+    bar = "!" * 88
+    logger.warning(
+        "\n" + bar + "\n"
+        f"!!! [INPUT_TO_VF LENGTH FILTER]\n"
+        f"!!!   dataset     : {dataset_name}\n"
+        f"!!!   tokenizer   : {model_path}\n"
+        f"!!!   threshold   : input_to_VF > {max_input_tokens} tokens  -> DROPPED\n"
+        f"!!!   dropped     : {dropped} / {total} samples "
+        f"({(dropped / total * 100) if total else 0:.2f}%)\n"
+        f"!!!   kept        : {total - dropped}\n"
+        f"!!!   max_len_seen: {max_len_seen} tokens\n"
+        + bar
+    )
+
+
+def _pick_score7_suffix_index(proof_scores) -> int:
+    """Return the suffix_id of the first proof_scores entry with points==7,
+    falling back to 0 when proof_scores is missing/empty/no-7s.
+    """
+    if not proof_scores:
+        return 0
+    try:
+        for entry in proof_scores:
+            if isinstance(entry, dict) and int(entry.get("points", 0)) == 7:
+                return int(entry.get("suffix_id", 0))
+    except (TypeError, ValueError):
+        return 0
+    return 0
+
+
+_DATA_GENERATOR_TASK_TEMPLATE = """You are a strategy planner. Given a math problem, a partial solution prefix, and the ground-truth full completion, predict the remaining high-level strategy bullets that bridge the prefix to the final answer.
+
+PROBLEM:
+{problem}
+
+SOLUTION_PREFIX:
+{prefix}
+
+GROUND_TRUTH_COMPLETION:
+{gt_completion}
+
+Output the strategy in exactly this format (and nothing else after):
+
+PREDICTED REMAINING STEPS:
+- bullet 1 (concrete mathematical move)
+- bullet 2
+- ...
+"""
+
+
+def process_genvf_data_generator(
+    dataset,
+    dataset_name,
+    model_path=None,
+    max_input_tokens=32000,
+):
+    """Processor for the data-generator RL setup.
+
+    Reads `problem`, `prefix`, `suffix_response` (list[str]), `proof_scores`,
+    `rubrics`, `row_id` from each row. Picks the score-7 suffix as
+    `gt_completion` (fallback to index 0). Builds the data-generator's user
+    prompt that includes (problem, prefix, gt_completion).
+    """
+    if model_path is None:
+        raise ValueError(
+            "process_genvf_data_generator requires model_path to tokenize the "
+            "constructed task and filter by length. Pass via dataset_loader_params.model_path."
+        )
+    tokenizer = _get_tokenizer(model_path)
+
+    total = 0
+    dropped_no_suffix = 0
+    dropped_long = 0
+    max_len_seen = 0
+
+    for item in dataset:
+        total += 1
+        suffix_responses = item.get("suffix_response") or []
+        if not suffix_responses:
+            dropped_no_suffix += 1
+            continue
+        idx = _pick_score7_suffix_index(item.get("proof_scores"))
+        if idx >= len(suffix_responses):
+            idx = 0
+        gt_completion = suffix_responses[idx]
+        if not gt_completion:
+            dropped_no_suffix += 1
+            continue
+
+        problem = item["problem"]
+        prefix = item["prefix"]
+        marking_scheme = item.get("rubrics") or ""
+
+        task = _DATA_GENERATOR_TASK_TEMPLATE.format(
+            problem=problem,
+            prefix=prefix,
+            gt_completion=gt_completion,
+        )
+
+        n_tokens = len(tokenizer.encode(task, add_special_tokens=False))
+        if n_tokens > max_len_seen:
+            max_len_seen = n_tokens
+        if n_tokens > max_input_tokens:
+            dropped_long += 1
+            continue
+
+        yield {
+            "problem": problem,
+            "prefix": prefix,
+            "gt_completion": gt_completion,
+            "marking_scheme": marking_scheme,
+            "task": task,
+            "dataset": dataset_name,
+            "row_id": item.get("row_id"),
+            "data_generator_mode": True,
+        }
+
+    bar = "!" * 88
+    kept = total - dropped_no_suffix - dropped_long
+    logger.warning(
+        "\n" + bar + "\n"
+        f"!!! [DATA_GENERATOR LENGTH FILTER]\n"
+        f"!!!   dataset           : {dataset_name}\n"
+        f"!!!   tokenizer         : {model_path}\n"
+        f"!!!   threshold         : task > {max_input_tokens} tokens  -> DROPPED\n"
+        f"!!!   dropped (no suffix): {dropped_no_suffix} / {total}\n"
+        f"!!!   dropped (long)   : {dropped_long} / {total}\n"
+        f"!!!   kept              : {kept}\n"
+        f"!!!   max_len_seen      : {max_len_seen} tokens\n"
+        + bar
+    )
+
+
+def process_genvf_summary_llm_judge_nextN(
+    dataset,
+    dataset_name,
+    squash_score=False,
+    model_path=None,
+    max_input_tokens=24000,
+):
+
+    assert dataset['input_to_VF'] is not None, "input_to_VF field is required for genvf summary llm judge datasets"
+    assert dataset['detailed_suffix_summary'] is not None, "detailed_suffix_summary field is required for genvf summary llm judge datasets"
+
+    if model_path is None:
+        raise ValueError(
+            "process_genvf_summary_llm_judge_nextN requires model_path to tokenize and "
+            "filter input_to_VF by length. Pass it via dataset_loader_params.model_path."
+        )
+    tokenizer = _get_tokenizer(model_path)
+
+    total = 0
+    dropped_empty = 0
+    dropped_long = 0
+    max_len_seen = 0
+
+    for item in dataset:
+        total += 1
+        summary_list = [i for i in item['detailed_suffix_summary'] if i!=""] # filter out empty summaries
+        if summary_list == []:
+            dropped_empty += 1
+            continue
+
+        problem = item['problem']
+        prefix = item['prefix']
+        prompt = item['input_to_VF']
+
+        n_tokens = len(tokenizer.encode(prompt, add_special_tokens=False))
+        if n_tokens > max_len_seen:
+            max_len_seen = n_tokens
+        if n_tokens > max_input_tokens:
+            dropped_long += 1
+            continue
+
+        yield {
+            "problem": problem,
+            "prefix": prefix,
+            "prefix_summary_steps": item.get('prefix_summary_steps', prefix),
+            "answer": item["answer"],
+            "gemini_summary_list": summary_list,
+            "dataset": dataset_name,
+            "task": prompt,
+            "squash_score": squash_score,
+        }
+
+    bar = "!" * 88
+    kept = total - dropped_empty - dropped_long
+    logger.warning(
+        "\n" + bar + "\n"
+        f"!!! [INPUT_TO_VF LENGTH FILTER / nextN]\n"
+        f"!!!   dataset        : {dataset_name}\n"
+        f"!!!   tokenizer      : {model_path}\n"
+        f"!!!   threshold      : input_to_VF > {max_input_tokens} tokens  -> DROPPED\n"
+        f"!!!   dropped (long) : {dropped_long} / {total} samples "
+        f"({(dropped_long / total * 100) if total else 0:.2f}%)\n"
+        f"!!!   dropped (empty): {dropped_empty} / {total} samples\n"
+        f"!!!   kept           : {kept}\n"
+        f"!!!   max_len_seen   : {max_len_seen} tokens\n"
+        + bar
+    )
+
+
+def process_VF(dataset, dataset_name, use_hl_gauss, sigma=0.06, reverse_kl=False):
+    for item in dataset:
+        prompt = item['prefix']
+        answer = "\\boxed{" + item["answer"] + "}"
+        
+        if use_hl_gauss:
+            mean_reward = item['mean_reward']
+
+            def hl_gauss_reward_integration(target_val, sigma):
+                """
+                HL-Gauss based on integration over defined boundaries.
+                """
+                probs = []
+                boundaries = np.array([0.0, 0.03125, 0.234375, 0.546875, 0.90625, 1.0]) # based on quintiles on train set
+
+                for i in range(len(boundaries) - 1):
+                    lower_bound = boundaries[i]
+                    upper_bound = boundaries[i+1]
+                    
+                    # (Probability Mass) p = CDF(upper) - CDF(lower)
+                    p = norm.cdf(upper_bound, loc=target_val, scale=sigma) - \
+                        norm.cdf(lower_bound, loc=target_val, scale=sigma)
+                    probs.append(p)
+                
+                probs = np.array(probs)
+                
+                # normalization, because gaussian is from -inf to +inf, but we truncate to [0,1] --> truncated gaussian distribution
+                return probs / probs.sum()
+
+            reward_probs = hl_gauss_reward_integration(mean_reward, sigma=sigma)
+            yield {
+                "dataset": dataset_name,
+                "task": prompt,
+                "answer": answer,
+                "reward_probs": reward_probs,
+                "reverse_kl": reverse_kl
+            }
+        else:
+            yield {
+                "dataset": dataset_name,
+                "task": prompt,
+                "answer": answer,
+            }
+
 
 def process_proof_problem(dataset, dataset_name):
     for row in dataset:
@@ -226,7 +533,9 @@ def add_ids(dataset: list[dict]):
 
 
 def load_datasets(
-    dataset_names: List[str | Dict[str, Any]] | Dict[str, Any] | str | None, seed: int | None = None
+    dataset_names: List[str | Dict[str, Any]] | Dict[str, Any] | str | None,
+    seed: int | None = None,
+    model_path: str | None = None,
 ) -> List[Tuple[str, Dict]]:
     if dataset_names is None:
         return []
@@ -255,8 +564,53 @@ def load_datasets(
             if config is not None:
                 load_args += (config,)
             dataset = load_dataset(*load_args, split=split, trust_remote_code=trust_remote_code)
-            if hub_id in ["hf-imo-colab/olympiads-proof-schema", "hf-imo-colab/olympiads-proof-schema-benchmark", "hf-imo-colab/olympiads-proof-schema-cleaned"]:
+            if dataset_spec.get("data_generator"):
+                # Data-generator RL: predict z from (problem, prefix, GT completion).
+                dataset_name = f"{hub_id.split('/')[-1]}_{split}" if split != "train" else hub_id.split("/")[-1]
+                samples = [
+                    s for s in process_genvf_data_generator(
+                        dataset,
+                        dataset_name,
+                        model_path=model_path,
+                    ) if s is not None
+                ]
+            elif hub_id in ["hf-imo-colab/olympiads-proof-schema", "hf-imo-colab/olympiads-proof-schema-benchmark", "hf-imo-colab/olympiads-proof-schema-cleaned"]:
                 samples = [s for s in process_proof_problem(dataset, hub_id.split("/")[-1]) if s is not None]
+            # multi-class classification datasets
+            elif hub_id in [
+                'haoranli-ml/value_func_data_v1_with_Q_labels_and_sum_prefix-half_oracle_train-PRL', 'haoranli-ml/VF_10k_distr_out_balanced', 
+                'haoranli-ml/VF_8k_distr_out_cdf_bin', "haoranli-ml/VF_8k_distr_out_cdf_bin_future_prompts"
+            ]:
+                use_hl_gauss = dataset_spec.get("use_hl_gauss", False)
+                reverse_kl = dataset_spec.get("reverse_kl", False)
+                sigma = dataset_spec.get("sigma", 0.06)
+                # Include split name in dataset name to distinguish different test sets
+                dataset_name = f"{hub_id.split('/')[-1]}_{split}" if split != "train" else hub_id.split("/")[-1]
+                samples = [s for s in process_VF(dataset, dataset_name, use_hl_gauss, sigma, reverse_kl) if s is not None]
+            elif hub_id.startswith("haoranli-ml/genvf"):
+                dataset_name = f"{hub_id.split('/')[-1]}_{split}" if split != "train" else hub_id.split("/")[-1]
+                squash_score = dataset_spec.get("squash_score", False)
+                if squash_score:
+                    logger.info(f"\n\n\n===== USING SQUASHED JUDGE SCORE FOR {dataset_name} ======\n\n\n")
+                if "nextN" in hub_id:
+                    logger.info(f"\n\n\n===== USING nextN TARGET for {dataset_name} ======\n\n\n")
+                    samples = [
+                        s for s in process_genvf_summary_llm_judge_nextN(
+                            dataset,
+                            dataset_name,
+                            squash_score=squash_score,
+                            model_path=model_path,
+                        ) if s is not None
+                    ]
+                else:
+                    samples = [
+                        s for s in process_genvf_summary_llm_judge(
+                            dataset,
+                            dataset_name,
+                            squash_score=squash_score,
+                            model_path=model_path,
+                        ) if s is not None
+                    ]
             else:
                 samples = [dict(row) for row in dataset]
             for sample in samples:

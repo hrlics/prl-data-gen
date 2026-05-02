@@ -60,9 +60,10 @@ logger = logging.getLogger(__name__)
 from pipelinerl.finetune.data import MASKED_TOKEN_ID
 
 
-_WANDB_VERIFIER_TABLE_COLUMNS = ["group_index", "prompt", "reasoning", "output", "score"]
+_WANDB_VERIFIER_TABLE_COLUMNS = ["group_index", "optimizer_step", "prompt", "reasoning", "output", "score"]
 _WANDB_ROLLOUT_TABLE_COLUMNS = [
     "group_index",
+    "optimizer_step",
     "prompt",
     "prompt_tokens",
     "reasoning",
@@ -71,6 +72,46 @@ _WANDB_ROLLOUT_TABLE_COLUMNS = [
     "output_tokens",
     "total_tokens",
 ]
+
+
+def _resolve_tokenizer_name(model_path: str | Path, model_revision: str | None) -> str:
+    model_name = str(model_path)
+    if Path(model_name).exists() or not model_revision:
+        return model_name
+
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception:
+        logger.warning(
+            "huggingface_hub unavailable; tokenizer for %s will not be pinned to revision %s",
+            model_name,
+            model_revision,
+        )
+        return model_name
+
+    try:
+        # Pin tokenizer/config resolution to the same Hub revision used by vLLM.
+        return snapshot_download(
+            repo_id=model_name,
+            revision=str(model_revision),
+            allow_patterns=[
+                "config.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "special_tokens_map.json",
+                "added_tokens.json",
+                "vocab.json",
+                "merges.txt",
+                "*.model",
+            ],
+        )
+    except Exception:
+        logger.exception(
+            "Failed to resolve tokenizer snapshot for %s at revision %s; falling back to repo id",
+            model_name,
+            model_revision,
+        )
+        return model_name
 
 
 def split_reasoning_output(
@@ -104,10 +145,10 @@ class VerifierTableBuffer:
     def __init__(self, keep_last_k_groups: int = 32, log_every_n_groups: int = 32):
         self.keep_last_k_groups = max(0, int(keep_last_k_groups))
         self.log_every_n_groups = max(1, int(log_every_n_groups))
-        self._groups: deque[list[dict[str, str | int]]] = deque()
+        self._groups: deque[list[dict[str, str | int | float | list | None]]] = deque()
         self._groups_added = 0
 
-    def add_group(self, entries: list[dict[str, str | int]]) -> None:
+    def add_group(self, entries: list[dict[str, str | int | float | list | None]]) -> None:
         """Add a group of entries (rows) to the buffer."""
         if not entries:
             return
@@ -127,6 +168,7 @@ class VerifierTableBuffer:
             for entry in group_entries:
                 table.add_data(
                     entry.get("group_index", 0),
+                    entry.get("optimizer_step", None),
                     entry.get("prompt", ""),
                     entry.get("reasoning", ""),
                     entry.get("output_text", ""),
@@ -154,10 +196,10 @@ class RolloutTableBuffer:
     def __init__(self, keep_last_k_groups: int = 32, log_every_n_groups: int = 32):
         self.keep_last_k_groups = max(0, int(keep_last_k_groups))
         self.log_every_n_groups = max(1, int(log_every_n_groups))
-        self._groups: deque[list[dict[str, str | int]]] = deque()
+        self._groups: deque[list[dict[str, str | int | float | list | None]]] = deque()
         self._groups_added = 0
 
-    def add_group(self, entries: list[dict[str, str | int]]) -> None:
+    def add_group(self, entries: list[dict[str, str | int | float | list | None]]) -> None:
         """Add a group of entries (rows) to the buffer."""
         if not entries:
             return
@@ -177,6 +219,7 @@ class RolloutTableBuffer:
             for entry in group_entries:
                 table.add_data(
                     entry.get("group_index", 0),
+                    entry.get("optimizer_step", None),
                     entry.get("prompt", ""),
                     entry.get("prompt_tokens", 0),
                     entry.get("reasoning", ""),
@@ -685,6 +728,9 @@ class ActorLoop:
         self.latency_list = []
         self.model_versions_list = []
         self.sliding_stats = defaultdict(list)
+        # For classification metrics (yes/no answers) - per dataset
+        self.predictions_by_dataset = defaultdict(list)
+        self.ground_truths_by_dataset = defaultdict(list)
     
     def compute_domain_agnostic_metrics(self, result: RolloutResult) -> dict[str, float]:
         metrics = {}
@@ -697,7 +743,7 @@ class ActorLoop:
         return metrics
 
     def update_stats(self, rollout_results: list[RolloutResult]):
-        for result in rollout_results:
+        for result in rollout_results: # rollouts.py return RolloutResult
             assert result.model_version is not None
             assert isinstance(result.metrics, BaseMetrics), "Metrics should be an instance of BaseMetrics"
             dataset_name = result.dataset_name
@@ -713,6 +759,18 @@ class ActorLoop:
                     self.stats[k][dataset_name][group_id].append(v)
                 else:
                     raise ValueError(f"Unsupported metric type: {type(v)} for key {k}")
+            
+            # Collect predictions and ground truths for classification metrics (per dataset)
+            # Assumes the rollout result has 'prediction' and 'answer' in metadata
+            if result.training_texts and len(result.training_texts) > 0:
+                training_text = result.training_texts[-1]  # Use the last training text
+                if hasattr(training_text, 'metadata') and 'answer' in training_text.metadata:
+                    # Get prediction from output_text
+                    prediction = getattr(training_text, 'output_text', '')
+                    ground_truth = training_text.metadata.get('answer', '')
+                    if prediction and ground_truth and dataset_name:
+                        self.predictions_by_dataset[dataset_name].append(prediction)
+                        self.ground_truths_by_dataset[dataset_name].append(ground_truth)
         
         prompt_length_tokens = [training_text.prompt_tokens for result in rollout_results for training_text in result.training_texts]
         output_length_tokens = [training_text.output_tokens for result in rollout_results for training_text in result.training_texts]
@@ -871,12 +929,15 @@ class ActorLoop:
 
                 if self.cfg.wandb.use_wandb and self.wandb_table_enabled:
                     group_index_value = finished_groups + 1
-                    group_entries: list[dict[str, str | int]] = []
+                    group_entries: list[dict[str, str | int | float | list | None]] = []
                     for result in rollout_results:
                         entry = getattr(result, "verifier_table_entry", None)
                         if entry:
                             entry_with_index = dict(entry)
                             entry_with_index["group_index"] = group_index_value
+                            entry_with_index["optimizer_step"] = self.trainer_state.get_completed_steps_for_version(
+                                result.model_version
+                            )
                             group_entries.append(entry_with_index)
                     if group_entries:
                         self.verifier_table_buffer.add_group(group_entries)
@@ -890,7 +951,7 @@ class ActorLoop:
                 if self.cfg.wandb.use_wandb and self.rollout_table_enabled:
                     self._maybe_load_rollout_tokenizer()
                     group_index_value = finished_groups + 1
-                    rollout_group_entries: list[dict[str, str | int]] = []
+                    rollout_group_entries: list[dict[str, str | int | float | list | None]] = []
                     for result in rollout_results:
                         if not result.training_texts:
                             continue
@@ -922,8 +983,11 @@ class ActorLoop:
                             except Exception as e:
                                 logger.warning(f"Failed to tokenize for rollout table: {e}")
 
-                        rollout_entry: dict[str, str | int] = {
+                        rollout_entry: dict[str, str | int | float | list | None] = {
                             "group_index": group_index_value,
+                            "optimizer_step": self.trainer_state.get_completed_steps_for_version(
+                                result.model_version
+                            ),
                             "prompt": prompt,
                             "prompt_tokens": prompt_tokens,
                             "reasoning": reasoning,
@@ -991,6 +1055,40 @@ class ActorLoop:
                 for agg, sub_stats in calculate_stats(list_of_stats_per_metric_and_dataset).items():
                     stats[f"{dataset_name}/{metric_name}_{agg}"] = sub_stats
 
+        # Calculate classification metrics per dataset
+        if self.predictions_by_dataset and self.ground_truths_by_dataset:
+            try:
+                from pipelinerl.domains.math.classification_metrics import calculate_classification_metrics
+                
+                # Calculate overall classification metrics (all datasets combined)
+                all_predictions = []
+                all_ground_truths = []
+                for dataset_name in self.predictions_by_dataset.keys():
+                    all_predictions.extend(self.predictions_by_dataset[dataset_name])
+                    all_ground_truths.extend(self.ground_truths_by_dataset[dataset_name])
+                
+                if all_predictions and all_ground_truths:
+                    overall_classification_stats = calculate_classification_metrics(
+                        predictions=all_predictions,
+                        ground_truths=all_ground_truths,
+                        prefix=split_name
+                    )
+                    stats.update(overall_classification_stats)
+                
+                # Calculate per-dataset classification metrics
+                for dataset_name in self.predictions_by_dataset.keys():
+                    if self.predictions_by_dataset[dataset_name] and self.ground_truths_by_dataset[dataset_name]:
+                        dataset_classification_stats = calculate_classification_metrics(
+                            predictions=self.predictions_by_dataset[dataset_name],
+                            ground_truths=self.ground_truths_by_dataset[dataset_name],
+                            prefix=f"{dataset_name}/"
+                        )
+                        stats.update(dataset_classification_stats)
+            except ImportError:
+                logger.warning("Could not import classification_metrics module")
+            except Exception as e:
+                logger.error(f"Error calculating classification metrics: {e}")
+
         stats |= (
             {
                 f"{split_name}{k}": v
@@ -1052,12 +1150,13 @@ def run_actor_loop(cfg: DictConfig):
         actor_model_path = finetune_model_path
     else:
         actor_model_path = cfg.model_path
+    tokenizer_name = _resolve_tokenizer_name(actor_model_path, getattr(cfg, "model_revision", None))
     
     train_llms = [
         TrainableLLM(
             base_url=url,
             model_name=str(actor_model_path),
-            tokenizer_name=str(actor_model_path),
+            tokenizer_name=tokenizer_name,
             parameters=cfg.llm.parameters,
             use_cache=False,
             collect_logprobs=True,
@@ -1069,7 +1168,7 @@ def run_actor_loop(cfg: DictConfig):
         TrainableLLM(
             base_url=url,
             model_name=str(actor_model_path),
-            tokenizer_name=str(actor_model_path),
+            tokenizer_name=tokenizer_name,
             parameters=cfg.test_llm.parameters,
             use_cache=False,
             collect_logprobs=True,

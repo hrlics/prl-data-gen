@@ -1,7 +1,9 @@
 # CMU-AIRe Setup
 
 ## TODO List
+
 [] Unify the data loading mechanism
+
 [] Separate the logging mechanism for different dataset sources (e.g., different benchmarks)
 
 

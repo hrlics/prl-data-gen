@@ -15,11 +15,11 @@
 # compilation does not play nice with Ray
 export TORCH_COMPILE_DISABLE=1
 
-module load cuda/12.9
+# module load cuda/12.9
 set -x -e
 
 source ~/.bashrc
-source grader/bin/activate
+source /project/flame/aviralku/envs/grader/bin/activate
 
 START_TIME=$(date +%s)
 echo "START TIME: $(date)"

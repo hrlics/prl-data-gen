@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=1 # Run one main task per node
 #SBATCH --gres=gpu:8        # 8 GPUs per node
 #SBATCH --cpus-per-task=16  # 16 CPUs per node (ensure nodes have this many cores available)
-#SBATCH --mem=512G         # 1024G RAM per node (ensure nodes have this much memory)
+#SBATCH --mem=512G         # 512G RAM per node (ensure nodes have this much memory)
 #SBATCH --time=47:59:00
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err  # Good practice for separate error logs
@@ -13,7 +13,7 @@
 #SBATCH --account=aviralku
 #SBATCH --exclude=orchard-flame-17
 
-JOB_WORKING_DIR="/home/asetlur/PipelineRL"
+JOB_WORKING_DIR="/home/haoranl4/projects/PipelineRL"
 JOB_SCRIPT_NAME="$JOB_WORKING_DIR/scripts/run.sh"
 
 # --- Setup ---

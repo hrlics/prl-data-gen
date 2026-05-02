@@ -13,7 +13,6 @@ authors = [
     { name = "ServiceNow" },
 ]
 dependencies = [
-    "torch>=2.6",
     "vllm==0.8.5.post1",
     "accelerate==1.7.0",
     "Tapeagents[finetune]==0.1.16",

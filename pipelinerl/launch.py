@@ -707,7 +707,9 @@ def main(cfg: DictConfig):
 
     # Spin up LLM grader if specified
     if cfg.llm_grader.name is not None:
-        if rank == 0:
+        if os.environ.get("OPENAI_BASE_URL"):
+            logger.info("OPENAI_BASE_URL already set; skipping local grader launch")
+        elif rank == 0:
             start_llm_grader(
                 cfg.llm_grader.name,
                 vllm_kwargs=getattr(cfg.llm_grader, "vllm_kwargs", None),

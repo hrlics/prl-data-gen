@@ -78,6 +78,16 @@ def init_wandb(
         if not wandb_name.startswith(root + "/"):
             raise ValueError(f"run_dir {run_dir} does not start with root {root}")
         wandb_name = wandb_name[len(root) + 1 :]
+    # wandb_name = cfg.wandb.wandb_name
+    # if wandb_name:
+    #     wandb_name = str(wandb_name)
+    # else:
+    #     wandb_name = str(run_dir)
+    #     root = cfg.wandb.wandb_workspace_root
+    #     if root:
+    #         if not wandb_name.startswith(root + "/"):
+    #             raise ValueError(f"run_dir {run_dir} does not start with root {root}")
+    #         wandb_name = wandb_name[len(root) + 1 :]
 
     wandb_id = cfg.wandb.wandb_id
     if not wandb_id:

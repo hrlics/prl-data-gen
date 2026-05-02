@@ -136,12 +136,18 @@ class WeightUpdateRequest(BaseModel):
 class WeightUpdateSuccess(BaseModel):
     kind: Literal["weight_update_success"] = "weight_update_success"
     version: int
+    # Optimizer step count at the time this version was broadcast.
+    # Optional for backward compatibility.
+    completed_steps: int | None = None
     timestamp: float = time.time()
 
  
 class SamplesProcessed(BaseModel):
     kind: Literal["samples_processed"] = "samples_processed"
     samples_processed: int
+    # Current optimizer step count (increments only when an optimizer step happens).
+    # Optional for backward compatibility.
+    completed_steps: int | None = None
     timestamp: float = time.time()
 
 TrainerMessage = WeightUpdateRequest | WeightUpdateSuccess | SamplesProcessed
@@ -175,6 +181,7 @@ class WeightUpdateManager:
     def send_weight_update(
         self,
         version: int,
+        completed_steps: int | None = None,
     ):
         if (
             isinstance(self.accelerated_model, deepspeed.DeepSpeedEngine)
@@ -213,7 +220,7 @@ class WeightUpdateManager:
             if get_accelerator().is_main_process:
                 assert self.update_stream is not None
                 with write_to_streams(self.update_stream) as writer:
-                    writer.write(WeightUpdateSuccess(version=version))
+                    writer.write(WeightUpdateSuccess(version=version, completed_steps=completed_steps))
         else:
             if isinstance(self.accelerated_model, AutoModelForCausalLMWithValueHead):
                 raise ValueError(
@@ -251,7 +258,7 @@ class WeightUpdateManager:
                     future.result()
                 logger.info("Finished broadcasting weights")
                 with write_to_streams(self.update_stream) as writer:
-                    writer.write(WeightUpdateSuccess(version=version))
+                    writer.write(WeightUpdateSuccess(version=version, completed_steps=completed_steps))
             else:
                 pass
             get_accelerator().wait_for_everyone()
@@ -422,7 +429,10 @@ def run_finetuning_loop(
         dt = log_time(dt, time_stats, "finetune/training_state_load")
 
     if get_accelerator().is_main_process:
-        trigger_message = SamplesProcessed(samples_processed=training_metrics.samples)
+        trigger_message = SamplesProcessed(
+            samples_processed=training_metrics.samples,
+            completed_steps=training_metrics.completed_steps,
+        )
         with write_to_streams(weight_update_stream) as writer:
             writer.write(trigger_message)
         
@@ -439,7 +449,10 @@ def run_finetuning_loop(
             actor_update_group=actor_update_group,
         )
         logger.info("Load the first version of the model into inference LLMs")
-        weight_update_manager.send_weight_update(training_metrics.samples)
+        weight_update_manager.send_weight_update(
+            training_metrics.samples,
+            completed_steps=training_metrics.completed_steps,
+        )
     else:
         weight_update_manager = None
 
@@ -697,7 +710,10 @@ def rl_finetuning_worker(
             passes_took.append(time.time() - time_before_pass)
 
         if get_accelerator().is_main_process:
-            trigger_message = SamplesProcessed(samples_processed=start_samples + total_samples)
+            trigger_message = SamplesProcessed(
+                samples_processed=start_samples + total_samples,
+                completed_steps=training_metrics.completed_steps,
+            )
             with write_to_streams(weight_update_stream) as writer:
                 writer.write(trigger_message)
 
@@ -818,7 +834,10 @@ def rl_finetuning_worker(
             and training_metrics.samples - training_metrics.last_broadcasted_version >= args.weight_update_interval
         ):
             assert weight_update_manager is not None
-            weight_update_manager.send_weight_update(training_metrics.samples)
+            weight_update_manager.send_weight_update(
+                training_metrics.samples,
+                completed_steps=training_metrics.completed_steps,
+            )
             training_metrics.last_broadcasted_version = training_metrics.samples
         get_accelerator().wait_for_everyone()
 

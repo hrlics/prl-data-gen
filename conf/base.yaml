@@ -52,7 +52,8 @@ llm:
     # 1.0
   reasoning_delimiters: ["</think>"]
   wandb_table:
-    enabled: true
+    # enabled: false
+    # max_rows: 512
     keep_last_k_groups: 32
     log_every_n_groups: 32
 test_llm:

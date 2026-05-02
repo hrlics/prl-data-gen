@@ -1,0 +1,126 @@
+defaults:
+    - base
+    - _self_
+
+model_path:  haoranli-ml/genvf-v3-hard_stage
+model_revision: v00.00-step-000240
+# Uncomment to skip test set rollouts
+eval_every_n_versions: 3000
+
+# samples_per_step = gradient_accumulation_passes×train_batch_size =4x8=32
+# question_per_update = samples_per_step/attemptes = 32/8=4
+# gradietn accmuluation per gpu = gradient_accumulation_passes // num_GPUs*train_fraction = 4//(1*4)=1
+
+finetune:
+  attempts: 8
+  train_batch_size: 16
+  valid_batch_size: 16
+  gradient_accumulation_passes: 16
+  seq_length: 23000
+  seq_parallel: 1
+  save_checkpoint_steps: 20
+  max_train_steps: 168 # 2687/32 = 84 84*2=168step 168*2= 336step
+  push_to_hub: true
+  hub_model_id: haoranli-ml/genvf-v3-hard_stage_purely_wo_oracle
+  hub_model_revision: v00.00
+  hub_ignore_patterns:
+    - "*.pt"
+    - "*.pth"
+
+llm:
+  parameters:
+    max_tokens: 8192
+    temperature: 0.8
+  reasoning_delimiters: null
+  wandb_table:
+    enabled: true
+    keep_last_k_groups: 4
+    log_every_n_groups: 500
+# Sampling params taken from Qwen3 tech report: https://arxiv.org/abs/2505.09388
+test_llm:
+  parameters: 
+    max_tokens: 8192
+    temperature: 0.8
+    top_p: 0.8
+    top_k: 20
+
+llm_grader:
+  name: openai/gpt-oss-20b # or gpt-oss-20b-reh if running via inference endpoints
+  vllm_kwargs:
+    num_nodes: 1
+    data-parallel-size: 8
+    tensor-parallel-size: 1
+    max-num-batched-tokens: 24576
+    max-num-seqs: 64
+    max-model-len: 32768
+    gpu-memory-utilization: 0.9
+  sampling_kwargs:
+    temperature: 1.0
+    max_output_tokens: 32768
+    reasoning:
+      effort: medium
+  prompt_name: genvf_v3_summary
+  reasoning_delimiters: ${llm.reasoning_delimiters}
+  wandb_table:
+    enabled: true
+    keep_last_k_groups: 4
+    log_every_n_groups: 500
+
+wandb:
+  wandb_dir: /project/flame/aviralku/wandb_logs/
+  wandb_entity_name: GenVF
+  wandb_project_name: GenVF_train
+  wandb_resume: always
+
+actor:
+  system_prompt: null
+  rollout_policy: pipelinerl.domains.math.generate_math_rollout
+  task_template: |-
+    {task}
+environment:
+  _target_: pipelinerl.domains.math.MathProofEnvironment
+  model_name: ${llm_grader.name}
+  sampling_kwargs: ${llm_grader.sampling_kwargs}
+  prompt_name: ${llm_grader.prompt_name}
+dataset_loader: pipelinerl.domains.math.load_datasets
+train_dataset_names:
+  - hub_id: haoranli-ml/genvf_diffifculty_curriculum_train
+    split: purely_wo_oracle_hard_train
+    # w_wo_oracle_hard_train
+    # split: wo_oracle_hard_plus_oracle_train
+test_dataset_names:
+  # - hub_id: haoranli-ml/genvf_diffifculty_curriculum_train
+  #   split: w_wo_oracle_hard_val
+  - hub_id: haoranli-ml/genvf_val_wo_oracle_easy # performance should not degrade on easy stage val set
+    split: test
+  - hub_id: haoranli-ml/genvf_val_hard_set_wo_oracle
+    split: test
+  - hub_id: haoranli-ml/genvf_val_hard_set_w_oracle
+    split: test
+    #split: wo_oracle_hard_plus_oracle_val
+
+vllm_config:
+  use_v1: false
+  vllm_kwargs:
+    dtype: bfloat16
+    gpu-memory-utilization: 0.9
+    num-scheduler-steps: 1
+    disable-log-requests: ""
+    disable-frontend-multiprocessing: ""
+    max-num-seqs: ${actor.llm_max_rollouts}
+    max-num-batched-tokens: 16384
+    max-model-len: ${finetune.seq_length}
+    enable-chunked-prefill: ""
+    return-tokens-as-token-ids: ""
+    tensor-parallel-size: 1
+    pipeline-parallel-size: 1
+    generation-config: vllm
+
+world:
+  replicas: 1
+  actor_fraction: 4
+  preprocessor_fraction: 0
+  finetune_fraction: 4
+  env_replicas: 1
+  actor_group_port: 9000
+  environment_start_port: 7777

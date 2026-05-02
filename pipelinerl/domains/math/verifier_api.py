@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 from pathlib import Path
+from datetime import datetime
 
 import math_verify  # Ensure math_verify is installed
 
@@ -36,6 +37,15 @@ logging.basicConfig(
 
 
 logger = logging.getLogger(__name__)
+
+
+def _timestamp() -> str:
+
+    """Return a formatted timestamp like '2026-01-11 12:30:25,750'."""
+
+    now = datetime.now()
+
+    return now.strftime("%Y-%m-%d %H:%M:%S,") + f"{now.microsecond // 1000:03d}"
 
 
 class TimeoutException(Exception):
@@ -184,6 +194,7 @@ async def verify_answer_rpc(
         "strict": strict,
         "max_prediction_length": max_prediction_length,
     }
+    # logger.info(f"Verifying answer with request: prediction: {prediction[:100]}, gold: {gold[:100]}, strict: {strict}, max_prediction_length: {max_prediction_length}")
     async with session.post(
         f"http://{host}:{port}/verify_answer",
         json=json,
@@ -291,7 +302,8 @@ _openai_client = None
 
 @dataclass
 class ProofVerificationResult:
-    score: int
+    # score: int
+    score: float
     metrics: dict[str, float | int] = field(default_factory=dict)
     table_entry: dict[str, str | int] | None = None
 
@@ -381,10 +393,12 @@ def get_openai_client():
 # Proof evaluator: calls OpenAI-compatible endpoint
 # =================================================
 async def verify_proof(
-    problem: str,
-    ref_solution: str,
-    schema: str,
+    problem: str | None,
+    ref_solution: str | None,
+    schema: str | None,
     generation: str,
+    prefix: str | None = None,
+    summaries: list[str] | None = None, # prediction target
     prompt_name: str | os.PathLike | None = None,
     model: str | None = None,
     sampling_kwargs: dict[str, Any] | None = None,
@@ -400,7 +414,7 @@ async def verify_proof(
     Returns a ProofVerificationResult that includes the integer score [0–7] and optional runtime metrics.
 
     Args:
-        schema: Markdown-formatted marking scheme expected by the grader prompt.
+        schema: Optional Markdown-formatted marking scheme expected by some grader prompts.
         prompt_name: Optional filename or path for the evaluator prompt template. If omitted,
             the default baseline prompt is used.
     Retries up to `max_retries` times if the OpenAI-compatible endpoint fails or hits rate limits.
@@ -409,7 +423,7 @@ async def verify_proof(
     collect_metrics = _should_collect_metrics(log_wandb_metrics)
     should_collect_table_entry = collect_metrics if collect_table_entry is None else collect_table_entry
 
-    if len(generation.strip()) == 0:
+    if generation is None or len(generation.strip()) == 0:
         rollout_metrics = _build_rollout_metrics(success=False, failure_causes=["no_input"], num_retries=0)
         return ProofVerificationResult(
             score=0,
@@ -417,16 +431,27 @@ async def verify_proof(
         )
 
     client = client or get_openai_client()
-    if not isinstance(schema, str):
+    if schema is None:
+        schema = ""
+    elif not isinstance(schema, str):
         raise TypeError("verify_proof expects schema as Markdown string; convert via parse_schema() first.")
 
     prompt_template = load_evaluator_prompt(prompt_name)
-    prompt_text = prompt_template.format(
-        problem=problem,
-        human_solution=ref_solution,
-        marking_scheme=schema,
-        solution=generation,
-    )
+    # prompt_text = prompt_template.format(
+    #     problem=problem,
+    #     human_solution=ref_solution,
+    #     marking_scheme=schema,
+    #     solution=generation,
+    # )
+
+    prompts = []
+    for i in range(len(summaries)):
+        prompts.append(prompt_template.format(
+            problem=problem,
+            prefix=prefix,
+            rubric=summaries[i], 
+            model_summary = generation,
+        ))
     if not model:
         raise RuntimeError("verify_proof requires a grader model name; pass via cfg.llm_grader.name")
     api_kwargs = dict(sampling_kwargs) if sampling_kwargs else {}
@@ -448,10 +473,314 @@ async def verify_proof(
     num_retries = 0
     runtime_metrics: dict[str, float | int] = {}
 
+    scores=[]
+    all_precisions=[]
+    all_recalls=[]
+    all_f1s=[]
+    output_texts=[]
+    reasoning_texts=[]
+    for prompt_text in prompts:
+        for attempt in range(1, max_retries + 1):
+            attempt_start = time.perf_counter()
+            try:
+                response = await asyncio.wait_for(_call_openai(), timeout=timeout_seconds)
+                latency_seconds = time.perf_counter() - attempt_start
+                usage = getattr(response, "usage", None)
+                output_tokens = None
+                input_tokens = None
+                if usage is not None:
+                    output_tokens = getattr(usage, "output_tokens", None)
+                    input_tokens = getattr(usage, "input_tokens", None)
+                    if output_tokens is None and isinstance(usage, dict):
+                        output_tokens = usage.get("output_tokens")
+                    if input_tokens is None and isinstance(usage, dict):
+                        input_tokens = usage.get("input_tokens")
+                if collect_metrics:
+                    runtime_metrics = {"verifier/runtime/latency_per_request": latency_seconds}
+                    if output_tokens is not None:
+                        runtime_metrics["verifier/runtime/output_tokens"] = output_tokens
+                    if input_tokens is not None:
+                        runtime_metrics["verifier/runtime/input_tokens"] = input_tokens
+                output_text = getattr(response, "output_text", None) or ""
+                if should_collect_table_entry:
+                    output_texts.append(output_text)
+                    reasoning_texts.append(_extract_reasoning_from_response(response))
+
+                # ===== Single score
+                # match = re.search(r"<score>(\d+)</score>", output_text)
+
+                # if match:
+                #     scores.append(int(match.group(1))/5.0) # normalize score to [0, 1] range
+                # else:
+                #     scores.append(-1) #-1 indicates invalid
+                # break  # Break out of retry loop on success
+
+                # ===== F1-styles scores
+                recall_block = re.search(r"<recall>(.*?)</recall>", output_text, re.DOTALL)
+                precision_block = re.search(r"<precision>(.*?)</precision>", output_text, re.DOTALL)
+
+                if not recall_block or not precision_block:
+                    attempt_failure_causes.append("no_score_tag")
+                    if attempt < max_retries:
+                        num_retries += 1
+                        wait_time = retry_backoff[min(attempt - 1, len(retry_backoff) - 1)]
+                        print(f"[verify_proof]: {_timestamp()} - No <recall>/<precision> tags (attempt {attempt}/{max_retries}), retrying in {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        print(f"[verify_proof]: {_timestamp()} - No <recall>/<precision> tags after {max_retries} attempts, accepting score=0")
+                        scores.append(0.0)
+                        all_precisions.append(0.0)
+                        all_recalls.append(0.0)
+                        all_f1s.append(0.0)
+                        break
+
+                recall_scores = [int(x) for x in re.findall(r"<s>(\d)</s>", recall_block.group(1))]
+                precision_scores = [int(x) for x in re.findall(r"<s>(\d)</s>", precision_block.group(1))]
+
+                K = len(recall_scores)
+                M = len(precision_scores)
+
+                R = sum(recall_scores) / (2 * K) if K > 0 else 0.0
+                P = sum(precision_scores) / (2 * M) if M > 0 else 0.0
+                F1 = 2 * R * P / (R + P) if (R + P) > 0 else 0.0
+                # ===== calc scores
+                scores.append(F1)
+                all_precisions.append(P)
+                all_recalls.append(R)
+                all_f1s.append(F1)
+                break  # Break out of retry loop on success
+
+            except openai.RateLimitError as e:
+                wait_time = retry_backoff[min(attempt - 1, len(retry_backoff) - 1)]
+                attempt_failure_causes.append("rate_limit")
+                if attempt < max_retries:
+                    num_retries += 1
+                print(f"[verify_proof]: {_timestamp()} - Rate limit hit (attempt {attempt}/{max_retries}), sleeping {wait_time}s: {e}")
+                await asyncio.sleep(wait_time)
+
+            except (asyncio.TimeoutError, TimeoutException):
+                wait_time = retry_backoff[min(attempt - 1, len(retry_backoff) - 1)]
+                attempt_failure_causes.append("timeout")
+                if attempt < max_retries:
+                    num_retries += 1
+                print(
+                    f"[verify_proof]: {_timestamp()} - Timeout after {timeout_seconds}s (attempt {attempt}/{max_retries}), "
+                    f"retrying in {wait_time}s..."
+                )
+                await asyncio.sleep(wait_time)
+
+            except Exception as e:
+                wait_time = retry_backoff[min(attempt - 1, len(retry_backoff) - 1)]
+                attempt_failure_causes.append("other")
+                if attempt < max_retries:
+                    num_retries += 1
+                print(f"[verify_proof]: {_timestamp()} - Error on attempt {attempt}/{max_retries}: {e}, retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+
+    valid_scores = [score for score in scores if score != -1]
+    score = sum(valid_scores) / len(valid_scores) if valid_scores else 0
+    if all_precisions:
+        runtime_metrics["verifier/scores/precision"] = sum(all_precisions) / len(all_precisions)
+    if all_recalls:
+        runtime_metrics["verifier/scores/recall"] = sum(all_recalls) / len(all_recalls)
+    if all_f1s:
+        runtime_metrics["verifier/scores/f1"] = sum(all_f1s) / len(all_f1s)
+    table_entry = None
+    if should_collect_table_entry:
+        table_entry = {
+            "prompt": "\n\n".join([f"{i}-th prompt. {text}" for i, text in enumerate(prompts)]),
+            "reasoning": "\n\n".join([f"{i}-th reasoning. {text}" for i, text in enumerate(reasoning_texts)]),
+            "output_text": "\n\n".join([f"{i}-th output. {text}" for i, text in enumerate(output_texts)]),
+            "score": score,
+        }
+    rollout_metrics = _build_rollout_metrics(
+        success=True if len(valid_scores)==len(prompts) else False,
+        failure_causes=attempt_failure_causes,
+        num_retries=num_retries,
+    )
+    return ProofVerificationResult(
+        score=score,
+        metrics=_merge_metrics(runtime_metrics, rollout_metrics),
+        table_entry=table_entry,
+    )
+
+
+# NOTE: below is for action items
+    # for attempt in range(1, max_retries + 1):
+    #     attempt_start = time.perf_counter()
+    #     try:
+    #         response = await asyncio.wait_for(_call_openai(), timeout=timeout_seconds)
+    #         latency_seconds = time.perf_counter() - attempt_start
+    #         usage = getattr(response, "usage", None)
+    #         output_tokens = None
+    #         input_tokens = None
+    #         if usage is not None:
+    #             output_tokens = getattr(usage, "output_tokens", None)
+    #             input_tokens = getattr(usage, "input_tokens", None)
+    #             if output_tokens is None and isinstance(usage, dict):
+    #                 output_tokens = usage.get("output_tokens")
+    #             if input_tokens is None and isinstance(usage, dict):
+    #                 input_tokens = usage.get("input_tokens")
+    #         if collect_metrics:
+    #             runtime_metrics = {"verifier/runtime/latency_per_request": latency_seconds}
+    #             if output_tokens is not None:
+    #                 runtime_metrics["verifier/runtime/output_tokens"] = output_tokens
+    #             if input_tokens is not None:
+    #                 runtime_metrics["verifier/runtime/input_tokens"] = input_tokens
+    #         output_text = getattr(response, "output_text", None) or ""
+            
+    #         # match = re.search(r"<score>(\d+)</score>", output_text)
+    #         covered_score = re.search(r"<covered_score>(\d+)</covered_score>", output_text)
+    #         uncovered_score = re.search(r"<uncovered_score>(\d+)</uncovered_score>", output_text)
+            
+    #         # if match:
+    #         if covered_score and uncovered_score:
+    #             # score = int(match.group(1))
+    #             covered_score = int(covered_score.group(1)) / len(gold_action_items)
+    #             uncovered_score = int(uncovered_score.group(1)) / len(generation)
+    #             precision  = 1 - uncovered_score
+    #             # F1 score of covered and uncovered
+    #             denom = covered_score + precision
+    #             f1 = 0.0 if denom == 0 else 2 * (covered_score * precision) / denom
+    #             score = f1
+
+    #             table_entry = None
+    #             if should_collect_table_entry:
+    #                 reasoning_text = _extract_reasoning_from_response(response)
+    #                 table_entry = {
+    #                     "prompt": prompt_text,
+    #                     "reasoning": reasoning_text,
+    #                     "output_text": output_text,
+    #                     "score": f"F1: {f1}, P: {precision}, R: {covered_score}",
+    #                 }
+    #             rollout_metrics = _build_rollout_metrics(
+    #                 success=True,
+    #                 failure_causes=attempt_failure_causes,
+    #                 num_retries=num_retries,
+    #             )
+    #             return ProofVerificationResult(
+    #                 score=score,
+    #                 metrics=_merge_metrics(runtime_metrics, rollout_metrics),
+    #                 table_entry=table_entry,
+    #             )
+    #         else:
+    #             table_entry = None
+    #             if should_collect_table_entry:
+    #                 reasoning_text = _extract_reasoning_from_response(response)
+    #                 table_entry = {
+    #                     "prompt": prompt_text,
+    #                     "reasoning": reasoning_text,
+    #                     "output_text": output_text,
+    #                     "score": "F1: 0, P: 0, R: 0",
+    #                     # "score": 0,
+    #                 }
+    #             rollout_metrics = _build_rollout_metrics(
+    #                 success=False,
+    #                 failure_causes=["no_score_tag"],
+    #                 num_retries=num_retries,
+    #             )
+    #             print(f"[verify_proof]: {_timestamp()} - No <score> tag found (attempt {attempt}) — returning 0")
+    #             return ProofVerificationResult(
+    #                 score=0,
+    #                 metrics=_merge_metrics(runtime_metrics, rollout_metrics),
+    #                 table_entry=table_entry,
+    #             )
+
+    #     except openai.RateLimitError as e:
+    #         wait_time = retry_backoff[min(attempt - 1, len(retry_backoff) - 1)]
+    #         attempt_failure_causes.append("rate_limit")
+    #         if attempt < max_retries:
+    #             num_retries += 1
+    #         print(f"[verify_proof]: {_timestamp()} - Rate limit hit (attempt {attempt}/{max_retries}), sleeping {wait_time}s: {e}")
+    #         await asyncio.sleep(wait_time)
+
+    #     except (asyncio.TimeoutError, TimeoutException):
+    #         wait_time = retry_backoff[min(attempt - 1, len(retry_backoff) - 1)]
+    #         attempt_failure_causes.append("timeout")
+    #         if attempt < max_retries:
+    #             num_retries += 1
+    #         print(
+    #             f"[verify_proof]: {_timestamp()} - Timeout after {timeout_seconds}s (attempt {attempt}/{max_retries}), "
+    #             f"retrying in {wait_time}s..."
+    #         )
+    #         await asyncio.sleep(wait_time)
+
+    #     except Exception as e:
+    #         wait_time = retry_backoff[min(attempt - 1, len(retry_backoff) - 1)]
+    #         attempt_failure_causes.append("other")
+    #         if attempt < max_retries:
+    #             num_retries += 1
+    #         print(f"[verify_proof]: {_timestamp()} - Error on attempt {attempt}/{max_retries}: {e}, retrying in {wait_time}s...")
+    #         await asyncio.sleep(wait_time)
+
+    # print(f"[verify_proof]: {_timestamp()} - All {max_retries} attempts failed — returning score=0")
+    # rollout_metrics = _build_rollout_metrics(
+    #     success=False,
+    #     failure_causes=attempt_failure_causes,
+    #     num_retries=num_retries,
+    # )
+    # return ProofVerificationResult(
+    #     score=0,
+    #     metrics=_merge_metrics(runtime_metrics, rollout_metrics),
+    # )
+
+
+# =================================================
+# Data-generator RL helpers (gpt-oss judge calls)
+# =================================================
+
+@dataclass
+class OssCallResult:
+    output_text: str
+    reasoning_text: str
+    runtime_metrics: dict[str, float | int]
+    failure_causes: list[str]
+    num_retries: int
+    success: bool
+
+
+async def _call_oss(
+    prompt_text: str,
+    *,
+    model: str,
+    sampling_kwargs: dict[str, Any] | None,
+    client=None,
+    timeout_seconds: int = 900,
+    max_retries: int = 3,
+    retry_backoff: list[int] = [15, 30, 60, 90, 120],
+) -> OssCallResult:
+    """Single-prompt OpenAI-compatible call with retry/timeout, mirroring the
+    inner loop of `verify_proof` but without any score-parsing.
+
+    Returns the raw output text plus reasoning trace and runtime metrics; the
+    caller is responsible for any score extraction.
+    """
+    if not model:
+        raise RuntimeError("_call_oss requires a grader model name")
+
+    client = client or get_openai_client()
+    api_kwargs = dict(sampling_kwargs) if sampling_kwargs else {}
+    loop = asyncio.get_event_loop()
+
+    async def _do_call():
+        return await loop.run_in_executor(
+            None,
+            lambda: client.responses.create(
+                model=model,
+                input=prompt_text,
+                **api_kwargs,
+            ),
+        )
+
+    failure_causes: list[str] = []
+    num_retries = 0
+    runtime_metrics: dict[str, float | int] = {}
+
     for attempt in range(1, max_retries + 1):
         attempt_start = time.perf_counter()
         try:
-            response = await asyncio.wait_for(_call_openai(), timeout=timeout_seconds)
+            response = await asyncio.wait_for(_do_call(), timeout=timeout_seconds)
             latency_seconds = time.perf_counter() - attempt_start
             usage = getattr(response, "usage", None)
             output_tokens = None
@@ -463,94 +792,256 @@ async def verify_proof(
                     output_tokens = usage.get("output_tokens")
                 if input_tokens is None and isinstance(usage, dict):
                     input_tokens = usage.get("input_tokens")
-            if collect_metrics:
-                runtime_metrics = {"verifier/runtime/latency_per_request": latency_seconds}
-                if output_tokens is not None:
-                    runtime_metrics["verifier/runtime/output_tokens"] = output_tokens
-                if input_tokens is not None:
-                    runtime_metrics["verifier/runtime/input_tokens"] = input_tokens
+            runtime_metrics = {"verifier/runtime/latency_per_request": latency_seconds}
+            if output_tokens is not None:
+                runtime_metrics["verifier/runtime/output_tokens"] = output_tokens
+            if input_tokens is not None:
+                runtime_metrics["verifier/runtime/input_tokens"] = input_tokens
             output_text = getattr(response, "output_text", None) or ""
-            match = re.search(r"<score>(\d+)</score>", output_text)
-            if match:
-                score = int(match.group(1))
-                table_entry = None
-                if should_collect_table_entry:
-                    reasoning_text = _extract_reasoning_from_response(response)
-                    table_entry = {
-                        "prompt": prompt_text,
-                        "reasoning": reasoning_text,
-                        "output_text": output_text,
-                        "score": score,
-                    }
-                rollout_metrics = _build_rollout_metrics(
-                    success=True,
-                    failure_causes=attempt_failure_causes,
-                    num_retries=num_retries,
-                )
-                return ProofVerificationResult(
-                    score=score,
-                    metrics=_merge_metrics(runtime_metrics, rollout_metrics),
-                    table_entry=table_entry,
-                )
-            else:
-                table_entry = None
-                if should_collect_table_entry:
-                    reasoning_text = _extract_reasoning_from_response(response)
-                    table_entry = {
-                        "prompt": prompt_text,
-                        "reasoning": reasoning_text,
-                        "output_text": output_text,
-                        "score": 0,
-                    }
-                rollout_metrics = _build_rollout_metrics(
-                    success=False,
-                    failure_causes=["no_score_tag"],
-                    num_retries=num_retries,
-                )
-                print(f"[verify_proof] No <score> tag found (attempt {attempt}) — returning 0")
-                return ProofVerificationResult(
-                    score=0,
-                    metrics=_merge_metrics(runtime_metrics, rollout_metrics),
-                    table_entry=table_entry,
-                )
-
-        except openai.RateLimitError as e:
-            wait_time = retry_backoff[min(attempt - 1, len(retry_backoff) - 1)]
-            attempt_failure_causes.append("rate_limit")
-            if attempt < max_retries:
-                num_retries += 1
-            print(f"[verify_proof] Rate limit hit (attempt {attempt}/{max_retries}), sleeping {wait_time}s: {e}")
-            await asyncio.sleep(wait_time)
-
-        except (asyncio.TimeoutError, TimeoutException):
-            wait_time = retry_backoff[min(attempt - 1, len(retry_backoff) - 1)]
-            attempt_failure_causes.append("timeout")
-            if attempt < max_retries:
-                num_retries += 1
-            print(
-                f"[verify_proof] Timeout after {timeout_seconds}s (attempt {attempt}/{max_retries}), "
-                f"retrying in {wait_time}s..."
+            reasoning_text = _extract_reasoning_from_response(response)
+            return OssCallResult(
+                output_text=output_text,
+                reasoning_text=reasoning_text,
+                runtime_metrics=runtime_metrics,
+                failure_causes=failure_causes,
+                num_retries=num_retries,
+                success=True,
             )
-            await asyncio.sleep(wait_time)
-
-        except Exception as e:
+        except openai.RateLimitError as e:
+            failure_causes.append("rate_limit")
             wait_time = retry_backoff[min(attempt - 1, len(retry_backoff) - 1)]
-            attempt_failure_causes.append("other")
             if attempt < max_retries:
                 num_retries += 1
-            print(f"[verify_proof] Error on attempt {attempt}/{max_retries}: {e}, retrying in {wait_time}s...")
+            print(f"[_call_oss]: {_timestamp()} - Rate limit (attempt {attempt}/{max_retries}), sleeping {wait_time}s: {e}")
+            await asyncio.sleep(wait_time)
+        except (asyncio.TimeoutError, TimeoutException):
+            failure_causes.append("timeout")
+            wait_time = retry_backoff[min(attempt - 1, len(retry_backoff) - 1)]
+            if attempt < max_retries:
+                num_retries += 1
+            print(f"[_call_oss]: {_timestamp()} - Timeout (attempt {attempt}/{max_retries}), retrying in {wait_time}s...")
+            await asyncio.sleep(wait_time)
+        except Exception as e:
+            failure_causes.append("other")
+            wait_time = retry_backoff[min(attempt - 1, len(retry_backoff) - 1)]
+            if attempt < max_retries:
+                num_retries += 1
+            print(f"[_call_oss]: {_timestamp()} - Error attempt {attempt}/{max_retries}: {e}, retrying in {wait_time}s...")
             await asyncio.sleep(wait_time)
 
-    print(f"[verify_proof] All {max_retries} attempts failed — returning score=0")
-    rollout_metrics = _build_rollout_metrics(
-        success=False,
-        failure_causes=attempt_failure_causes,
+    return OssCallResult(
+        output_text="",
+        reasoning_text="",
+        runtime_metrics=runtime_metrics,
+        failure_causes=failure_causes,
         num_retries=num_retries,
+        success=False,
     )
-    return ProofVerificationResult(
-        score=0,
-        metrics=_merge_metrics(runtime_metrics, rollout_metrics),
+
+
+@dataclass
+class JudgeCallResult:
+    score: float
+    output_text: str
+    reasoning_text: str
+    prompt_text: str
+    metrics: dict[str, float | int] = field(default_factory=dict)
+
+
+def _judge_metrics(call: OssCallResult, *, score_parsed: bool) -> dict[str, float | int]:
+    if call.success and score_parsed:
+        rollout = _build_rollout_metrics(success=True, failure_causes=call.failure_causes, num_retries=call.num_retries)
+    elif call.success and not score_parsed:
+        rollout = _build_rollout_metrics(success=False, failure_causes=["no_score_tag"], num_retries=call.num_retries)
+    else:
+        rollout = _build_rollout_metrics(success=False, failure_causes=call.failure_causes, num_retries=call.num_retries)
+    return _merge_metrics(call.runtime_metrics, rollout)
+
+
+async def generate_strategy(
+    problem: str,
+    prefix: str,
+    *,
+    prompt_name: str | os.PathLike,
+    model: str,
+    sampling_kwargs: dict[str, Any] | None = None,
+    client=None,
+    timeout_seconds: int = 900,
+    max_retries: int = 3,
+) -> JudgeCallResult:
+    """A: gpt-oss(problem, prefix) → z' (PREDICTED REMAINING STEPS bullets)."""
+    prompt_text = load_evaluator_prompt(prompt_name).format(problem=problem, prefix=prefix)
+    call = await _call_oss(
+        prompt_text,
+        model=model,
+        sampling_kwargs=sampling_kwargs,
+        client=client,
+        timeout_seconds=timeout_seconds,
+        max_retries=max_retries,
     )
+    # `score` slot is unused for A; we stash z' in output_text (caller parses).
+    metrics = _judge_metrics(call, score_parsed=call.success)
+    return JudgeCallResult(
+        score=0.0,
+        output_text=call.output_text,
+        reasoning_text=call.reasoning_text,
+        prompt_text=prompt_text,
+        metrics=metrics,
+    )
+
+
+async def judge_alignment(
+    problem: str,
+    prefix: str,
+    z: str,
+    z_prime: str,
+    *,
+    prompt_name: str | os.PathLike,
+    model: str,
+    sampling_kwargs: dict[str, Any] | None = None,
+    client=None,
+    timeout_seconds: int = 900,
+    max_retries: int = 3,
+) -> JudgeCallResult:
+    """B: precision/recall F1 between two bullet-list strategies, computed by
+    delegating to `verify_proof` with a single-summary CRITERION.
+
+    - CRITERION (`{rubric}`)        ← `z`       (4B's bullets, GT-informed)
+    - MODEL_SUMMARY (`{model_summary}`) ← `z_prime` (gpt-oss without GT)
+
+    Score returned is the F1 from `<recall>`/`<precision>` blocks, ∈ [0,1].
+    Also surfaces `verifier/scores/{precision,recall,f1}` runtime metrics.
+    """
+    if not z or not str(z).strip():
+        # No criterion → can't compute alignment. Mirror verify_proof's
+        # no_input behaviour: failure with score 0.
+        rollout_metrics = _build_rollout_metrics(success=False, failure_causes=["no_input"], num_retries=0)
+        return JudgeCallResult(
+            score=0.0,
+            output_text="",
+            reasoning_text="",
+            prompt_text="",
+            metrics=_merge_metrics({}, rollout_metrics),
+        )
+
+    verification = await verify_proof(
+        problem=problem,
+        ref_solution=None,
+        schema=None,
+        generation=z_prime,
+        prefix=prefix,
+        summaries=[z],
+        prompt_name=prompt_name,
+        model=model,
+        sampling_kwargs=sampling_kwargs,
+        client=client,
+        timeout_seconds=timeout_seconds,
+        max_retries=max_retries,
+        log_wandb_metrics=True,
+        collect_table_entry=True,
+    )
+    table = verification.table_entry or {}
+    return JudgeCallResult(
+        score=float(verification.score),
+        output_text=str(table.get("output_text", "")),
+        reasoning_text=str(table.get("reasoning", "")),
+        prompt_text=str(table.get("prompt", "")),
+        metrics=verification.metrics,
+    )
+
+
+async def complete_with_z(
+    problem: str,
+    prefix: str,
+    z: str,
+    *,
+    prompt_name: str | os.PathLike,
+    model: str,
+    sampling_kwargs: dict[str, Any] | None = None,
+    client=None,
+    timeout_seconds: int = 1800,
+    max_retries: int = 3,
+) -> JudgeCallResult:
+    """C1: gpt-oss(problem, prefix, z) → continuation. Caller will pass the
+    completion to `judge_proofbench_no_gt` for scoring; no score parsed here.
+    """
+    prompt_text = load_evaluator_prompt(prompt_name).format(
+        problem=problem, prefix=prefix, z=z
+    )
+    call = await _call_oss(
+        prompt_text,
+        model=model,
+        sampling_kwargs=sampling_kwargs,
+        client=client,
+        timeout_seconds=timeout_seconds,
+        max_retries=max_retries,
+    )
+    metrics = _judge_metrics(call, score_parsed=call.success)
+    return JudgeCallResult(
+        score=0.0,
+        output_text=call.output_text,
+        reasoning_text=call.reasoning_text,
+        prompt_text=prompt_text,
+        metrics=metrics,
+    )
+
+
+async def judge_proofbench_no_gt(
+    problem: str,
+    marking_scheme: str | None,
+    prefix: str,
+    completion: str,
+    *,
+    prompt_name: str | os.PathLike,
+    model: str,
+    sampling_kwargs: dict[str, Any] | None = None,
+    client=None,
+    timeout_seconds: int = 900,
+    max_retries: int = 3,
+) -> JudgeCallResult:
+    """C2: proofbench-no-gt rubric on `prefix + completion` → <points>N</points>
+    in [0,7] → N/7 ∈ [0,1].
+
+    Placeholder mapping (note: `{solution}` here = candidate proof to grade,
+    not the GT solution):
+      {problem}        ← problem
+      {marking_scheme} ← marking_scheme  (= dataset row['rubrics'])
+      {solution}       ← prefix + completion
+    """
+    student_proof = (prefix or "") + (completion or "")
+    prompt_text = load_evaluator_prompt(prompt_name).format(
+        problem=problem,
+        marking_scheme=marking_scheme or "(no rubric provided — use mathematical validity)",
+        solution=student_proof,
+    )
+    call = await _call_oss(
+        prompt_text,
+        model=model,
+        sampling_kwargs=sampling_kwargs,
+        client=client,
+        timeout_seconds=timeout_seconds,
+        max_retries=max_retries,
+    )
+    score = 0.0
+    parsed = False
+    if call.success:
+        m = re.search(r"<points>\s*(\d+)\s*</points>", call.output_text)
+        if m:
+            try:
+                raw = int(m.group(1))
+                score = max(0.0, min(raw / 7.0, 1.0))
+                parsed = True
+            except ValueError:
+                pass
+    metrics = _judge_metrics(call, score_parsed=parsed)
+    return JudgeCallResult(
+        score=score,
+        output_text=call.output_text,
+        reasoning_text=call.reasoning_text,
+        prompt_text=prompt_text,
+        metrics=metrics,
+    )
+
 
 class MathProofEnvironment:
     def __init__(
@@ -582,13 +1073,14 @@ class MathProofEnvironment:
             {
                 "problem": "...",
                 "ref_solution": "...",
-                "schema": "...",
-                "generation": "..."
+                "generation": "...",
+                "schema": "..."  # optional
             }
             """
             problem = request["problem"]
             ref_solution = request["ref_solution"]
-            schema = parse_schema(request["schema"])
+            schema_payload = request.get("schema")
+            schema = parse_schema(schema_payload) if schema_payload is not None else None
             generation = request["generation"]
 
             client = get_openai_client()

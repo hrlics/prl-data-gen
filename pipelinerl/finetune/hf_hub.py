@@ -111,13 +111,9 @@ def push_checkpoint_to_hub(
     if branch_parent:
         create_branch_kwargs["revision"] = branch_parent
 
-    try:
-        create_branch(**create_branch_kwargs)
-    except HfHubHTTPError as err:
-        # `exist_ok=True` still raises if revision/branch mismatch; surface once.
-        if err.response is not None and err.response.status_code not in (409, 422):
-            raise
-        log.debug("Hub branch %s already exists on %s", revision, hub_model_id)
+    _create_branch_with_retries(
+        create_branch_kwargs, revision, hub_model_id, max_retries, base_delay, max_delay
+    )
 
     commit_message = f"Add checkpoint {revision}"
 
@@ -136,6 +132,47 @@ def push_checkpoint_to_hub(
     setattr(future, "_hf_revision", revision)
     log.info("Started Hub upload for %s@%s from %s", hub_model_id, revision, checkpoint_dir)
     return future
+
+
+def _create_branch_with_retries(
+    create_branch_kwargs: dict,
+    revision: str,
+    hub_model_id: str,
+    max_retries: int,
+    base_delay: float,
+    max_delay: float,
+):
+    """Run create_branch with exponential backoff and jitter."""
+    delay = max(base_delay, 0.0)
+    attempts = max(1, max_retries)
+
+    for attempt in range(1, attempts + 1):
+        try:
+            create_branch(**create_branch_kwargs)
+            return
+        except HfHubHTTPError as err:
+            # `exist_ok=True` still raises if revision/branch mismatch; surface once.
+            if err.response is not None and err.response.status_code in (409, 422):
+                log.debug("Hub branch %s already exists on %s", revision, hub_model_id)
+                return
+
+            if attempt < attempts and _is_retryable_error(err):
+                sleep_for = min(delay if delay > 0 else base_delay, max_delay)
+                sleep_for *= random.uniform(0.8, 1.2)
+                sleep_for = min(sleep_for, max_delay)
+                log.warning(
+                    "create_branch attempt %d/%d failed for %s@%s (%s). Retrying in %.1fs",
+                    attempt,
+                    attempts,
+                    hub_model_id,
+                    revision,
+                    err,
+                    sleep_for,
+                )
+                time.sleep(max(0.0, sleep_for))
+                delay = min(delay * 2 if delay else base_delay * 2, max_delay)
+            else:
+                raise
 
 
 def _upload_with_retries(
