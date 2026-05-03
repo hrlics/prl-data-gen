@@ -3,6 +3,7 @@ import logging
 import random
 import re
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import datasets
@@ -110,24 +111,28 @@ def _pick_score7_suffix_index(proof_scores) -> int:
     return 0
 
 
-_DATA_GENERATOR_TASK_TEMPLATE = """You are a strategy planner. Given a math problem, a partial solution prefix, and the ground-truth full completion, predict the remaining high-level strategy bullets that bridge the prefix to the final answer.
+_DATA_GENERATOR_TASK_PROMPT_NAME = "data_generator_task_v1"
 
-PROBLEM:
-{problem}
 
-SOLUTION_PREFIX:
-{prefix}
+def _evaluator_prompts_dir() -> Path:
+    module_path = Path(__file__).resolve()
+    for parent in module_path.parents:
+        if (parent / "conf" / "evaluator_prompts").is_dir():
+            return (parent / "conf" / "evaluator_prompts").resolve()
+    raise FileNotFoundError(
+        f"Could not locate conf/evaluator_prompts/ relative to {module_path}"
+    )
 
-GROUND_TRUTH_COMPLETION:
-{gt_completion}
 
-Output the strategy in exactly this format (and nothing else after):
-
-PREDICTED REMAINING STEPS:
-- bullet 1 (concrete mathematical move)
-- bullet 2
-- ...
-"""
+@lru_cache(maxsize=8)
+def _load_data_generator_task_template(prompt_name: str) -> str:
+    filename = prompt_name if prompt_name.endswith(".md") else f"{prompt_name}.md"
+    prompt_path = _evaluator_prompts_dir() / filename
+    if not prompt_path.is_file():
+        raise FileNotFoundError(
+            f"Data-generator task prompt '{filename}' not found in {prompt_path.parent}"
+        )
+    return prompt_path.read_text(encoding="utf-8")
 
 
 def process_genvf_data_generator(
@@ -135,13 +140,15 @@ def process_genvf_data_generator(
     dataset_name,
     model_path=None,
     max_input_tokens=32000,
+    task_prompt_name=_DATA_GENERATOR_TASK_PROMPT_NAME,
 ):
     """Processor for the data-generator RL setup.
 
     Reads `problem`, `prefix`, `suffix_response` (list[str]), `proof_scores`,
     `rubrics`, `row_id` from each row. Picks the score-7 suffix as
     `gt_completion` (fallback to index 0). Builds the data-generator's user
-    prompt that includes (problem, prefix, gt_completion).
+    prompt that includes (problem, prefix, gt_completion). The prompt template
+    is loaded from `conf/evaluator_prompts/<task_prompt_name>.md`.
     """
     if model_path is None:
         raise ValueError(
@@ -149,6 +156,7 @@ def process_genvf_data_generator(
             "constructed task and filter by length. Pass via dataset_loader_params.model_path."
         )
     tokenizer = _get_tokenizer(model_path)
+    task_template = _load_data_generator_task_template(task_prompt_name)
 
     total = 0
     dropped_no_suffix = 0
@@ -173,7 +181,7 @@ def process_genvf_data_generator(
         prefix = item["prefix"]
         marking_scheme = item.get("rubrics") or ""
 
-        task = _DATA_GENERATOR_TASK_TEMPLATE.format(
+        task = task_template.format(
             problem=problem,
             prefix=prefix,
             gt_completion=gt_completion,
@@ -567,11 +575,13 @@ def load_datasets(
             if dataset_spec.get("data_generator"):
                 # Data-generator RL: predict z from (problem, prefix, GT completion).
                 dataset_name = f"{hub_id.split('/')[-1]}_{split}" if split != "train" else hub_id.split("/")[-1]
+                task_prompt_name = dataset_spec.get("task_prompt", _DATA_GENERATOR_TASK_PROMPT_NAME)
                 samples = [
                     s for s in process_genvf_data_generator(
                         dataset,
                         dataset_name,
                         model_path=model_path,
+                        task_prompt_name=task_prompt_name,
                     ) if s is not None
                 ]
             elif hub_id in ["hf-imo-colab/olympiads-proof-schema", "hf-imo-colab/olympiads-proof-schema-benchmark", "hf-imo-colab/olympiads-proof-schema-cleaned"]:

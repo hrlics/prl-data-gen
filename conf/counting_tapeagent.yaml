@@ -1,4 +1,0 @@
-defaults:
-    - counting
-actor:
-    rollout_policy: pipelinerl.domains.counting.tapeagent.generate_counting_rollout

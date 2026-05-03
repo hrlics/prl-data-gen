@@ -108,10 +108,12 @@ train_dataset_names:
   - hub_id: haoranli-ml/genvf-data-generator-100prefix-v1
     split: train
     data_generator: true
+    task_prompt: data_generator_task_v1 
 test_dataset_names:
   - hub_id: haoranli-ml/genvf-data-generator-100prefix-v1
     split: test
     data_generator: true
+    task_prompt: data_generator_task_v1
 
 vllm_config:
   use_v1: false

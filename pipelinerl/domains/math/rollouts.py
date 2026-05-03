@@ -99,9 +99,12 @@ def parse_summary(text: str):
     if not text:
         return None
 
-    # Find all header occurrences WITHOUT DOTALL so each match is independent
+    # Find all header occurrences WITHOUT DOTALL so each match is independent.
+    # Accept either the old "PREDICTED (REMAINING|NEXT) STEPS:" header (still used
+    # by the gpt-oss A call's predict_z_*.md prompts) or the newer
+    # "STRATEGIC BRIDGE:" header used by data_generator_task_v2+.
     matches = list(re.finditer(
-        r"PREDICTED\s+(?:REMAINING|NEXT)\s+STEPS\s*:",
+        r"(?:PREDICTED\s+(?:REMAINING|NEXT)\s+STEPS|STRATEGIC\s+BRIDGE)\s*:",
         text,
         flags=re.IGNORECASE,
     ))
@@ -502,7 +505,8 @@ async def generate_data_generator_rollout(
     """RL rollout for the data-generator setup.
 
     Policy: Qwen3-4B-Thinking-2507 sees (problem, prefix, GT completion) and
-    produces strategy bullets `z` (after `PREDICTED REMAINING STEPS:`).
+    produces strategy bullets `z` (after the prompt's marker, e.g.
+    `STRATEGIC BRIDGE:` or `PREDICTED REMAINING STEPS:`; see parse_summary).
     Reward = Fittability * Performance after conditioning, both scored by gpt-oss.
     """
     messages = []
@@ -553,7 +557,7 @@ async def generate_data_generator_rollout(
             penalty=0.0,
         )
         verifier_table_entry = {
-            "prompt": "(policy did not produce parseable PREDICTED REMAINING STEPS)",
+            "prompt": "(policy did not produce a parseable strategy header / bullets)",
             "reasoning": generation_raw[:4000],
             "output_text": generation_final[:4000],
             "score": "fitt=0.000 perf=0.000 final=0.000 (no z)",
